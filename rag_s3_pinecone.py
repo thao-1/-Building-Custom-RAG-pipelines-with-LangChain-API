@@ -7,8 +7,15 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 import boto3
+from botocore.exceptions import ClientError
+from bs4 import BeautifulSoup
+
+def clean_html_content(text):
+    """Clean HTML content and extract readable text"""
+    soup = BeautifulSoup(text, 'html.parser')
+    return soup.get_text(separator=' ', strip=True)
 
 def check_environment_variables():
     """Verify all required environment variables are set"""
@@ -16,7 +23,10 @@ def check_environment_variables():
         'AWS_ACCESS_KEY_ID',
         'AWS_SECRET_ACCESS_KEY',
         'PINECONE_API_KEY',
-        'OPENAI_API_KEY'
+        'OPENAI_API_KEY',
+        'S3_BUCKET_NAME',
+        'S3_FILE_KEY',
+        'AWS_REGION'
     ]
     
     missing_vars = [var for var in required_vars if not os.getenv(var)]
@@ -24,6 +34,8 @@ def check_environment_variables():
         raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
 def create_rag_chain():
+    """Create a RAG chain using S3FileLoader and Pinecone vector store"""
+    
     # Load and check environment variables
     load_dotenv()
     check_environment_variables()
@@ -31,9 +43,9 @@ def create_rag_chain():
     # Configure AWS credentials
     aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
     aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-    aws_region = os.getenv('AWS_REGION', 'us-east-1')
-    bucket_name = os.getenv('S3_BUCKET_NAME', 'langchain-rag-demo')
-    file_key = os.getenv('S3_FILE_KEY', 'python_basics.txt')
+    aws_region = os.getenv('AWS_REGION')
+    bucket_name = os.getenv('S3_BUCKET_NAME')
+    file_key = os.getenv('S3_FILE_KEY')
 
     print(f"Using AWS region: {aws_region}")
     print(f"Using S3 bucket: {bucket_name}")
@@ -46,15 +58,50 @@ def create_rag_chain():
             aws_secret_access_key=aws_secret_key,
             region_name=aws_region
         )
+        
+        # Configure S3 client with specific region
+        s3_config = {
+            'region_name': aws_region
+        }
+        s3 = session.client('s3', **s3_config)
+        
+        # Verify bucket exists and is accessible
+        try:
+            s3.head_bucket(Bucket=bucket_name)
+            print(f"Successfully connected to bucket: {bucket_name}")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == '404':
+                raise ValueError(f"Bucket {bucket_name} does not exist")
+            elif error_code == '403':
+                raise ValueError(f"Access denied to bucket {bucket_name}")
+            else:
+                raise ValueError(f"Error accessing bucket {bucket_name}: {str(e)}")
+
+        # Verify file exists
+        try:
+            s3.head_object(Bucket=bucket_name, Key=file_key)
+            print(f"Successfully verified file exists: {file_key}")
+        except ClientError as e:
+            raise ValueError(f"File {file_key} not found in bucket {bucket_name}")
 
         # Load documents from S3
-        loader = S3FileLoader(bucket=bucket_name, key=file_key, aws_session=session)
+        loader = S3FileLoader(
+            bucket=bucket_name,
+            key=file_key,
+            aws_session=session
+        )
         documents = loader.load()
         print(f"Successfully loaded {len(documents)} documents from S3")
         
-        # Print a sample of the content
-        print("\nSample of loaded content:")
-        print(documents[0].page_content[:500])
+        # Clean HTML content
+        for doc in documents:
+            doc.page_content = clean_html_content(doc.page_content)
+        
+        # Print a sample of the cleaned content
+        if documents:
+            print("\nSample of loaded content (cleaned):")
+            print(documents[0].page_content[:500])
 
         # Split documents into chunks
         text_splitter = RecursiveCharacterTextSplitter(
@@ -64,38 +111,21 @@ def create_rag_chain():
         )
         chunks = text_splitter.split_documents(documents)
         print(f"\nSplit documents into {len(chunks)} chunks")
-        print("\nSample chunk:")
-        print(chunks[0].page_content[:500])
+        
+        if chunks:
+            print("\nSample chunk:")
+            print(chunks[0].page_content[:500])
 
         # Initialize embeddings
         embeddings = OpenAIEmbeddings()
 
-        # Initialize Pinecone
-        pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+        # Initialize Pinecone with new API
+        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         index_name = "langchain-rag"
 
-        # Check if index exists, if not create it
-        existing_indexes = [index.name for index in pc.list_indexes()]
-        
-        if index_name not in existing_indexes:
-            print(f"\nCreating new Pinecone index: {index_name}")
-            pc.create_index(
-                name=index_name,
-                dimension=1536,
-                metric="cosine",
-                spec=ServerlessSpec(
-                    cloud="aws",
-                    region="us-west-2"
-                )
-            )
-        
-        # Get the index
-        index = pc.Index(index_name)
-        print(f"\nUsing existing Pinecone index: {index_name}")
-
-        # Create vector store
-        vectorstore = LangchainPinecone(
-            index=index,
+        # Create vector store using langchain's Pinecone wrapper
+        vectorstore = LangchainPinecone.from_existing_index(
+            index_name=index_name,
             embedding=embeddings,
             text_key="text"
         )
@@ -108,12 +138,11 @@ def create_rag_chain():
         # Create retriever with increased k value for more context
         retriever = vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 5}  # Increased from 3 to 5 for more context
+            search_kwargs={"k": 5}
         )
 
-        # Create custom prompt template with more explicit instructions
+        # Create custom prompt template
         template = """Use the following pieces of context to answer the question at the end. 
-        The context contains theological content about God and religious concepts.
         If you don't know the answer based on the given context, just say that you don't know.
         Do not make up or infer information that isn't directly supported by the context.
 
@@ -138,10 +167,9 @@ def create_rag_chain():
         )
 
         return qa_chain
-
     except Exception as e:
-        print(f"Error creating RAG chain: {str(e)}")
-        raise
+        print(f"Error in create_rag_chain: {str(e)}")
+        return None
 
 def ask_question(qa_chain, question: str):
     """
@@ -155,6 +183,9 @@ def ask_question(qa_chain, question: str):
         The answer from the chain
     """
     try:
+        if qa_chain is None:
+            raise ValueError("QA chain is not initialized")
+            
         result = qa_chain({"query": question})
         print("\nQuestion:", question)
         print("\nAnswer:", result["result"])
@@ -176,13 +207,16 @@ if __name__ == "__main__":
         # Create the RAG chain
         qa_chain = create_rag_chain()
         
-        # Test questions
+        if qa_chain is None:
+            print("Failed to initialize QA chain. Please check the errors above.")
+            exit(1)
+        
+        # Test questions 
         test_questions = [
-            "What are the main teachings about God in this textbook?",
-            "How does the textbook describe God's attributes and nature?",
-            "Can you summarize the key theological concepts discussed in this book?",
-            "What does the textbook say about God's relationship with humanity?",
-            "What are the main biblical themes covered in this document?"
+            "What are the main topics covered in this textbook?",
+            "What is the most important concept discussed in the text?",
+            "Can you summarize the key themes of this document?",
+            "How does the textbook describe God's relationship with humanity?",
         ]
         
         # Test the chain with questions
@@ -191,4 +225,4 @@ if __name__ == "__main__":
             print("\n" + "="*50 + "\n")
             
     except Exception as e:
-        print(f"Error in main execution: {str(e)}") 
+        print(f"Error in main execution: {str(e)}")

@@ -12,6 +12,8 @@ from langchain.prompts import PromptTemplate
 load_dotenv()
 
 def create_rag_chain():
+    """Create a RAG chain using local TextLoader and Chroma vector store"""
+    
     # Initialize document loader for the text file
     loader = TextLoader("textbook.txt")
     documents = loader.load()
@@ -30,12 +32,14 @@ def create_rag_chain():
     embeddings = OpenAIEmbeddings()
 
     # Create and persist Chroma vector store
+    persist_directory = "./chroma_db"
     vectorstore = Chroma.from_documents(
         documents=splits,
         embedding=embeddings,
-        persist_directory="./chroma_db"
+        persist_directory=persist_directory
     )
-    print("Created and persisted Chroma vector store")
+    vectorstore.persist()
+    print(f"Created and persisted Chroma vector store to {persist_directory}")
 
     # Create a retriever
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
@@ -80,16 +84,15 @@ if __name__ == "__main__":
     # Create the RAG chain
     qa_chain = create_rag_chain()
     
-    # Test questions
+    # Test questions 
     test_questions = [
-        "What are the main teachings about God in this textbook?",
-        "How does the textbook describe God's attributes and nature?",
-        "Can you summarize the key theological concepts discussed in this book?",
-        "What does the textbook say about God's relationship with humanity?",
-        "What are the main biblical themes covered in this document?"
+        "What are the main topics covered in this textbook?",
+        "What is the most important concept discussed in the text?",
+        "Can you summarize the key themes of this document?",
+        "How does the textbook describe God's relationship with humanity?",
     ]
     
     # Test the RAG pipeline
     for question in test_questions:
         ask_question(qa_chain, question)
-        print("\n" + "="*50 + "\n") 
+        print("\n" + "="*50 + "\n")

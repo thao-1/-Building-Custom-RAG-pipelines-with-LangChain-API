@@ -1,6 +1,7 @@
 import os
+import ssl
 from dotenv import load_dotenv
-from langchain_community.document_loaders import RecursiveUrlLoader
+from langchain_community.document_loaders import BSHTMLLoader
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Weaviate
@@ -9,28 +10,59 @@ from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import weaviate
-from weaviate.connect import ConnectionParams
+from weaviate.auth import AuthApiKey
+import time
+import certifi
 
 # Load environment variables
 load_dotenv()
 
 def create_rag_chain():
-    # Initialize Weaviate client
-    client = weaviate.WeaviateClient(
-        connection_params=ConnectionParams.with_api_key(
-            api_key=os.getenv("WEAVIATE_API_KEY"),
-            host=os.getenv("WEAVIATE_URL")
-        )
-    )
+    """Create a RAG chain using RecursiveUrlLoader and Weaviate vector store"""
+    
+    # Check if WEAVIATE_API_KEY is set
+    if not os.getenv("WEAVIATE_API_KEY"):
+        raise ValueError("WEAVIATE_API_KEY must be set in .env file")
+    
+    # Fix for SSL certificate verification on macOS
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    
+    # Try to connect to Weaviate with retries
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Connecting to Weaviate (attempt {attempt+1}/{max_retries})...")
+            # Connect to Weaviate Cloud Services
+            client = weaviate.connect_to_weaviate_cloud(
+                cluster_url="https://uwbal7cfrxykokk30y5ukg.c0.us-west3.gcp.weaviate.cloud",
+                auth_credentials=weaviate.auth.AuthApiKey(os.getenv("WEAVIATE_API_KEY")),
+                headers={
+                    "X-OpenAI-Api-Key": os.getenv("OPENAI_API_KEY")  # Optional: if using OpenAI modules
+                },
+                additional_headers={},
+                grpc_port=443,
+                grpc_secure=True
+            )
+            # Test connection
+            client.is_ready()
+            print("✅ Successfully connected to Weaviate!")
+            break
+        except Exception as e:
+            print(f"❌ Attempt {attempt+1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                print("All connection attempts failed.")
+                raise
 
-    # Initialize document loader for web crawling
-    loader = RecursiveUrlLoader(
-        url="https://realpython.com/python-basics/",  # Real Python Python Basics Tutorial
-        max_depth=2,
-        extractor=lambda x: BeautifulSoup(x, "html.parser").get_text()
-    )
+    # Initialize document loader for local HTML file
+    loader = BSHTMLLoader("realpython.html")
     documents = loader.load()
-    print(f"Loaded {len(documents)} document(s) from URL")
+    print(f"Loaded {len(documents)} document(s) from local HTML file")
 
     # Split text into chunks
     text_splitter = RecursiveCharacterTextSplitter(
@@ -44,30 +76,22 @@ def create_rag_chain():
     # Initialize embeddings
     embeddings = OpenAIEmbeddings()
 
-    # Create Weaviate schema if it doesn't exist
-    class_name = "RAGDocument"
-    schema = {
-        "class": class_name,
-        "vectorizer": "none",  # We'll use OpenAI embeddings
-        "properties": [
-            {
-                "name": "text",
-                "dataType": ["text"],
-            },
-            {
-                "name": "source",
-                "dataType": ["text"],
-            }
-        ]
-    }
-
-    # Check if schema exists and create if it doesn't
-    try:
-        client.schema.get(class_name)
-        print(f"Using existing Weaviate schema: {class_name}")
-    except:
-        client.schema.create_class(schema)
-        print(f"Created new Weaviate schema: {class_name}")
+    # Create Weaviate collection if it doesn't exist
+    class_name = "PythonBasics"
+    
+    # Check if collection exists
+    if class_name not in [col.name for col in client.collections.list_all()]:
+        client.collections.create(
+            name=class_name,
+            vectorizer_config="none",  # Using external embeddings
+            properties=[
+                {"name": "text", "data_type": "text"},
+                {"name": "source", "data_type": "text"}
+            ]
+        )
+        print(f"✅ Created new collection: {class_name}")
+    else:
+        print(f"✅ Using existing collection: {class_name}")
 
     # Create vector store
     vectorstore = Weaviate(
@@ -127,12 +151,13 @@ if __name__ == "__main__":
     
     # Test questions
     test_questions = [
-        "What are the main topics covered in this document?",
-        "What is the roadmap for Python learners?",
-        "How does the web crawling process work?",
+        "What are the main topics covered in Python basics?",
+        "How do I install Python?",
+        "What are Python variables and data types?",
+        "How does control flow work in Python?",
     ]
     
     # Test the RAG pipeline
     for question in test_questions:
         ask_question(qa_chain, question)
-        print("\n" + "="*50 + "\n") 
+        print("\n" + "="*50 + "\n")

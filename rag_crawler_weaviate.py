@@ -4,13 +4,14 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import BSHTMLLoader
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Weaviate
+from langchain_weaviate import WeaviateVectorStore
 from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import weaviate
 from weaviate.auth import AuthApiKey
+from weaviate.collections.classes.config import DataType
 import time
 import certifi
 
@@ -24,12 +25,16 @@ def create_rag_chain():
     if not os.getenv("WEAVIATE_API_KEY"):
         raise ValueError("WEAVIATE_API_KEY must be set in .env file")
     
+    # Print Weaviate version for debugging
+    print(f"Using Weaviate client version: {weaviate.__version__}")
+    
     # Fix for SSL certificate verification on macOS
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     
     # Try to connect to Weaviate with retries
     max_retries = 3
     retry_delay = 2  # seconds
+    client = None
     
     for attempt in range(max_retries):
         try:
@@ -40,10 +45,7 @@ def create_rag_chain():
                 auth_credentials=weaviate.auth.AuthApiKey(os.getenv("WEAVIATE_API_KEY")),
                 headers={
                     "X-OpenAI-Api-Key": os.getenv("OPENAI_API_KEY")  # Optional: if using OpenAI modules
-                },
-                additional_headers={},
-                grpc_port=443,
-                grpc_secure=True
+                }
             )
             # Test connection
             client.is_ready()
@@ -80,26 +82,27 @@ def create_rag_chain():
     class_name = "PythonBasics"
     
     # Check if collection exists
-    if class_name not in [col.name for col in client.collections.list_all()]:
+    try:
+        existing_collection = client.collections.get(class_name)
+        print(f"✅ Using existing collection: {class_name}")
+    except weaviate.exceptions.WeaviateCollectionNotFoundException:
+        # Create collection with proper data types
         client.collections.create(
             name=class_name,
-            vectorizer_config="none",  # Using external embeddings
+            vectorizer_config=None,  # Using external embeddings
             properties=[
-                {"name": "text", "data_type": "text"},
-                {"name": "source", "data_type": "text"}
+                {"name": "text", "data_type": DataType.TEXT},
+                {"name": "source", "data_type": DataType.TEXT}
             ]
         )
         print(f"✅ Created new collection: {class_name}")
-    else:
-        print(f"✅ Using existing collection: {class_name}")
 
     # Create vector store
-    vectorstore = Weaviate(
+    vectorstore = WeaviateVectorStore(
         client=client,
         index_name=class_name,
         text_key="text",
-        embedding=embeddings,
-        by_text=False
+        embedding=embeddings
     )
 
     # Add documents to Weaviate
@@ -135,7 +138,7 @@ def create_rag_chain():
         chain_type_kwargs={"prompt": PROMPT}
     )
     
-    return qa_chain
+    return qa_chain, client
 
 def ask_question(qa_chain, question: str):
     """Ask a question and get an answer from the RAG system"""
@@ -146,18 +149,24 @@ def ask_question(qa_chain, question: str):
     return result
 
 if __name__ == "__main__":
-    # Create the RAG chain
-    qa_chain = create_rag_chain()
-    
-    # Test questions
-    test_questions = [
-        "What are the main topics covered in Python basics?",
-        "How do I install Python?",
-        "What are Python variables and data types?",
-        "How does control flow work in Python?",
-    ]
-    
-    # Test the RAG pipeline
-    for question in test_questions:
-        ask_question(qa_chain, question)
-        print("\n" + "="*50 + "\n")
+    client = None
+    try:
+        # Create the RAG chain
+        qa_chain, client = create_rag_chain()
+        
+        # Test questions
+        test_questions = [
+            "What are the main topics covered in Python basics?",
+            "How do I install Python?",
+            "What are Python variables and data types?",
+            "How does control flow work in Python?",
+        ]
+        
+        # Test the RAG pipeline
+        for question in test_questions:
+            ask_question(qa_chain, question)
+            print("\n" + "="*50 + "\n")
+    finally:
+        # Close the Weaviate client connection
+        if client is not None:
+            client.close()
